@@ -1,6 +1,8 @@
 import io
 import numpy as np
 import pandas as pd
+from scipy.optimize import root_scalar
+import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
@@ -45,6 +47,30 @@ class CPTuEngine:
     u0 = np.where(depth > gwl, (depth - gwl) * self.gamma_w, 0.0)
     sigma_v0_eff = np.maximum(sigma_v0 - u0, 1.0)
     return sigma_v0, u0, sigma_v0_eff
+
+  def compute_iterative_cn(self, sigma_v0_eff, n_raw):
+    """Solves the iterative overburden correction factor CN (Eq. 5.4 - Idriss & Boulanger 2008)
+
+    using Scipy's root finding algorithm.
+    """
+    cn_values = []
+    for s_eff, n_val in zip(sigma_v0_eff, n_raw):
+      stress_ratio = self.p_atm / s_eff
+
+      # Implicit function: CN - (Pa / sigma_v0_eff)^(0.784 - 0.0768 * sqrt(CN * N)) = 0
+      def f(cn_candidate):
+        n1_candidate = max(n_val * cn_candidate, 0.0)
+        exponent = 0.784 - 0.0768 * np.sqrt(n1_candidate)
+        return cn_candidate - (stress_ratio**exponent)
+
+      try:
+        sol = root_scalar(f, bracket=[0.1, 2.5], method="brentq")
+        cn_val = sol.root if sol.converged else (stress_ratio**0.5)
+      except Exception:
+        cn_val = np.clip(stress_ratio**0.5, 0.1, 2.0)
+
+      cn_values.append(np.clip(cn_val, 0.1, 2.0))
+    return np.array(cn_values)
 
   def compute_normalized_parameters(
       self, qt, fs, u2, sigma_v0, u0, sigma_v0_eff
@@ -159,7 +185,7 @@ def generate_synthetic_data():
   )
 
 
-def build_cptu_plot(df, u0):
+def build_interactive_plot(df, u0):
   fig = make_subplots(
       rows=1,
       cols=5,
@@ -168,13 +194,12 @@ def build_cptu_plot(df, u0):
           "Tip Resistance qt",
           "Sleeve Friction fs",
           "Pore Pressure u2",
-          "Friction Angle / su",
-          "SBTn Classification",
+          "Undrained Shear su",
+          "SBTn Zone",
       ),
       horizontal_spacing=0.03,
   )
 
-  # Column 1: qt
   fig.add_trace(
       go.Scatter(
           x=df["qt_kPa"],
@@ -186,8 +211,6 @@ def build_cptu_plot(df, u0):
       row=1,
       col=1,
   )
-
-  # Column 2: fs
   fig.add_trace(
       go.Scatter(
           x=df["fs_kPa"],
@@ -199,8 +222,6 @@ def build_cptu_plot(df, u0):
       row=1,
       col=2,
   )
-
-  # Column 3: u2 & u0
   fig.add_trace(
       go.Scatter(
           x=df["u2_kPa"],
@@ -223,8 +244,6 @@ def build_cptu_plot(df, u0):
       row=1,
       col=3,
   )
-
-  # Column 4: Strength (phi or su)
   fig.add_trace(
       go.Scatter(
           x=df["su_kPa"],
@@ -236,8 +255,6 @@ def build_cptu_plot(df, u0):
       row=1,
       col=4,
   )
-
-  # Column 5: SBTn
   fig.add_trace(
       go.Scatter(
           x=df["SBTn_Zone"],
@@ -270,7 +287,6 @@ def build_cptu_plot(df, u0):
       row=1,
       col=5,
   )
-
   fig.update_layout(
       height=750,
       margin=dict(l=40, r=40, t=50, b=40),
@@ -278,6 +294,51 @@ def build_cptu_plot(df, u0):
       showlegend=True,
   )
   return fig
+
+
+def generate_static_report_figure(df, u0):
+  """Uses Matplotlib to generate an executive-ready static log for print/reporting."""
+  fig, axes = plt.subplots(1, 5, figsize=(15, 8), sharey=True)
+
+  axes[0].plot(df["qt_kPa"], df["depth_m"], color="navy", lw=1.5)
+  axes[0].set_xlabel("qt (kPa)")
+  axes[0].set_ylabel("Depth (m)")
+  axes[0].grid(True, linestyle="--", alpha=0.5)
+
+  axes[1].plot(df["fs_kPa"], df["depth_m"], color="darkred", lw=1.5)
+  axes[1].set_xlabel("fs (kPa)")
+  axes[1].grid(True, linestyle="--", alpha=0.5)
+
+  axes[2].plot(df["u2_kPa"], df["depth_m"], color="teal", lw=1.5, label="u2")
+  axes[2].plot(
+      u0, df["depth_m"], color="black", linestyle="--", lw=1.2, label="u0"
+  )
+  axes[2].set_xlabel("Pore Pressure (kPa)")
+  axes[2].legend(loc="lower right")
+  axes[2].grid(True, linestyle="--", alpha=0.5)
+
+  axes[3].plot(df["su_kPa"], df["depth_m"], color="darkorange", lw=1.5)
+  axes[3].set_xlabel("su (kPa)")
+  axes[3].grid(True, linestyle="--", alpha=0.5)
+
+  axes[4].scatter(
+      df["SBTn_Zone"], df["depth_m"], c=df["SBTn_Zone"], cmap="tab10", s=18
+  )
+  axes[4].set_xlabel("SBTn Zone (1-9)")
+  axes[4].set_xlim(0.5, 9.5)
+  axes[4].grid(True, linestyle="--", alpha=0.5)
+
+  axes[0].invert_yaxis()
+  plt.suptitle(
+      "CPTu Geotechnical Profiling & Soil Behavior Type (CFEM-5)", fontsize=13
+  )
+  plt.tight_layout()
+
+  buf = io.BytesIO()
+  plt.savefig(buf, format="png", dpi=300)
+  plt.close(fig)
+  buf.seek(0)
+  return buf
 
 
 def main():
@@ -320,7 +381,6 @@ def main():
     st.sidebar.info("Using representative synthetic sounding data.")
     df_raw = generate_synthetic_data()
 
-  # Check required columns
   req_cols = ["depth_m", "qc_kPa", "fs_kPa", "u2_kPa"]
   if not all(col in df_raw.columns for col in req_cols):
     st.error(f"Input file must contain the following columns: {req_cols}")
@@ -340,6 +400,11 @@ def main():
   sigma_v0, u0, sigma_v0_eff = engine.calculate_stresses(
       depth, gamma_est, gwl=gwl
   )
+
+  # Scipy-based iterative CN calculation (CFEM Eq. 5.4)
+  n_equivalent = np.clip(qc / 300.0, 1.0, 50.0)
+  cn_iterative = engine.compute_iterative_cn(sigma_v0_eff, n_equivalent)
+
   Q, Fr, Bq, Ic = engine.compute_normalized_parameters(
       qt, fs, u2, sigma_v0, u0, sigma_v0_eff
   )
@@ -358,6 +423,7 @@ def main():
       "sigma_v0_kPa": np.round(sigma_v0, 1),
       "sigma_v0_eff_kPa": np.round(sigma_v0_eff, 1),
       "u0_kPa": np.round(u0, 1),
+      "CN_iterative": np.round(cn_iterative, 3),
       "Q": np.round(Q, 2),
       "Fr": np.round(Fr, 2),
       "Bq": np.round(Bq, 3),
@@ -370,17 +436,26 @@ def main():
       "G0_MPa": np.round(params["G0_MPa"], 1),
   })
 
-  # Visualization
-  tab1, tab2 = st.tabs(["Sounding Profiles", "Tabular Dataset"])
+  # UI Display
+  tab1, tab2 = st.tabs(["Interactive Dashboard", "Tabular Dataset"])
 
   with tab1:
-    fig = build_cptu_plot(df_processed, u0)
-    st.plotly_chart(fig, use_container_width=True)
+    fig_interactive = build_interactive_plot(df_processed, u0)
+    st.plotly_chart(fig_interactive, use_container_width=True)
 
   with tab2:
     st.dataframe(df_processed, use_container_width=True)
 
-  # Excel Export
+  # Static Log Export (Matplotlib)
+  report_png = generate_static_report_figure(df_processed, u0)
+  st.sidebar.download_button(
+      label="Download High-Res Log (PNG)",
+      data=report_png,
+      file_name="CPTu_Profile_Plot.png",
+      mime="image/png",
+  )
+
+  # Excel Export (Openpyxl)
   output = io.BytesIO()
   with pd.ExcelWriter(output, engine="openpyxl") as writer:
     df_processed.to_excel(writer, sheet_name="CPTu_Interpreted", index=False)
